@@ -1,6 +1,7 @@
 #include "ftl.h"
 
 #include <time.h>
+#include <signal.h>
 
 //#define FEMU_DEBUG_FTL
 
@@ -915,6 +916,12 @@ static void *ftl_thread(void *arg)
 
     struct timespec tstart_slice = {0, 0};
     struct timespec tstart_window = {0, 0}; */
+
+    struct sigaction sigact_start, sigact_finish;
+    sigact_start.sa_handler = start_logging;
+    sigact_finish.sa_handler = end_logging;
+    sigaction(SIGUSR1, &sigact_start, NULL);
+    sigaction(SIGUSR2, &sigact_finish, NULL);
 
     while (1) {
         for (i = 1; i <= n->num_poller; i++) {
