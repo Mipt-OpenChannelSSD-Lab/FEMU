@@ -6,10 +6,11 @@
 
 static void *ftl_thread(void *arg);
 
-// rw_opcode: 1 - write, 2 - read
-static void log_request(NvmeRequest *req, FILE *raw_data_log, int rw_opcode);
+static void log_request(NvmeRequest *req, char rw_opcode);
 
-static void log_measure(struct timespec* tstart_slice, struct timespec* tstart_window, FILE *data_log);
+static void log_measure();
+
+// static void init_logger(struct timespec *tstart_slice, struct timespec *tstart_window);
 
 const double time_slice = 1.0;
 const double time_window = 3.0;
@@ -18,6 +19,19 @@ int reads_for_slice = 0;
 int reads_for_window = 0;
 int writes_for_window = 0;
 int cum_reads_lenght = 0;
+
+int enable_logging = 0;
+int logger_call_start_count = 0;
+struct timespec tstart_slice = {0, 0};
+struct timespec tstart_window = {0, 0};
+FILE *raw_data_log = NULL;
+FILE *data_log = NULL;
+
+// signal handler for SIGUSR1
+void start_logging(int signum);
+
+// signal handler for SIGUSR2
+void end_logging(int signum);
 
 static inline bool should_gc(struct ssd *ssd)
 {
@@ -892,7 +906,7 @@ static void *ftl_thread(void *arg)
 
     // printf("sector size is %d\nsectors in block %d\n", ssd->sp.secsz, ssd->sp.secs_per_blk);
 
-    FILE *raw_data_log = fopen("raw_data_log.txt","w+");
+    /* FILE *raw_data_log = fopen("raw_data_log.txt","w+");
     assert(raw_data_log != NULL);
     fprintf(raw_data_log, "rw_opcode\tlba\tlen\ttime\n");
     FILE *data_log = fopen("data_log.txt","w+");
@@ -900,13 +914,13 @@ static void *ftl_thread(void *arg)
     fprintf(data_log, "OWIO\tOWST\tPWIO\tAVGWIO\n");
 
     struct timespec tstart_slice = {0, 0};
-    struct timespec tstart_window = {0, 0};
-    clock_gettime(CLOCK_MONOTONIC, &tstart_slice);
-    clock_gettime(CLOCK_MONOTONIC, &tstart_window);
+    struct timespec tstart_window = {0, 0}; */
 
     while (1) {
         for (i = 1; i <= n->num_poller; i++) {
-            log_measure(&tstart_slice, &tstart_window, data_log);
+            if (enable_logging == 1) {
+                log_measure();
+            }
 
             if (!ssd->to_ftl[i] || !femu_ring_count(ssd->to_ftl[i]))
                 continue;
@@ -919,12 +933,16 @@ static void *ftl_thread(void *arg)
             ftl_assert(req);
             switch (req->cmd.opcode) {
             case NVME_CMD_WRITE: {
-                log_request(req, raw_data_log, 1);
+                if (enable_logging == 1) {
+                    log_request(req, "w");
+                }
                 lat = ssd_write(ssd, req);
                 break;
             }
             case NVME_CMD_READ: {
-                log_request(req, raw_data_log, 2);
+                if (enable_logging == 1) {
+                    log_request(req, "r");
+                }
                 lat = ssd_read(ssd, req);
                 break;
             }
@@ -951,21 +969,19 @@ static void *ftl_thread(void *arg)
         }
     }
 
-    fclose(raw_data_log);
-    fclose(data_log);
     return NULL;
 }
 
-static void log_request(NvmeRequest *req, FILE *raw_data_log, int rw_opcode)
+static void log_request(NvmeRequest *req, char rw_opcode)
 {
     int len = req->nlb;
-    if (rw_opcode == 2) {
+    if (rw_opcode == "r") {
         reads_for_slice++;
         reads_for_window++;
         cum_reads_lenght += len;
     }
 
-    if (rw_opcode == 1) {
+    if (rw_opcode == "w") {
         writes_for_window++;
     }
 
@@ -973,11 +989,11 @@ static void log_request(NvmeRequest *req, FILE *raw_data_log, int rw_opcode)
     struct timespec cur_time = {0, 0};
     clock_gettime(CLOCK_MONOTONIC, &cur_time);
     double time = (double)cur_time.tv_sec + 1.0e-9*cur_time.tv_nsec;
-    fprintf(raw_data_log, "%d\t%lu\t%d\t%lf\n", rw_opcode, lba, len, time);
+    fprintf(raw_data_log, "%c\t%lu\t%d\t%lf\n", rw_opcode, lba, len, time);
     fflush(raw_data_log);
 }
 
-static void log_measure(struct timespec* tstart_slice, struct timespec* tstart_window, FILE *data_log)
+static void log_measure()
 {
     struct timespec tend = {0, 0};
     clock_gettime(CLOCK_MONOTONIC, &tend);
@@ -1022,4 +1038,77 @@ static void log_measure(struct timespec* tstart_slice, struct timespec* tstart_w
         fprintf(data_log, "\t%lf\t%d\t%lf\n", owst, pwio, avgwio);
         fflush(data_log);
     }
+}
+
+/* 
+static void init_logger(struct timespec *tstart_slice, struct timespec *tstart_window)
+{
+    char num[3];
+    sprintf(num, "%d", logger_call_start_count);
+
+    char raw_data_log_str[25] = "raw_data_log.txt";
+    char data_log_str[25] = "data_log.txt";
+    strcat(raw_data_log_str, num);
+    strcat(data_log_str, num);
+
+    raw_data_log = fopen(raw_data_log_str,"w+");
+    assert(raw_data_log != NULL);
+    fprintf(raw_data_log, "rw_opcode\tlba\tlen\ttime\n");
+
+    data_log = fopen(data_log_str,"w+");
+    assert(data_log != NULL);
+    fprintf(data_log, "OWIO\tOWST\tPWIO\tAVGWIO\n");
+
+    clock_gettime(CLOCK_MONOTONIC, &tstart_slice);
+    clock_gettime(CLOCK_MONOTONIC, &tstart_window);
+} */
+
+void start_logging(int signum)
+{
+    errno = 0;
+    char num[3];
+    sprintf(num, "%d", logger_call_start_count);
+
+    char raw_data_log_str[25] = "raw_data_log";
+    char data_log_str[25] = "data_log";
+    strcat(raw_data_log_str, num);
+    strcat(data_log_str, num);
+
+    raw_data_log = fopen(raw_data_log_str,"w+");
+    assert(raw_data_log != NULL);
+    fprintf(raw_data_log, "rw_opcode\tlba\tlen\ttime\n");
+
+    data_log = fopen(data_log_str,"w+");
+    assert(data_log != NULL);
+    fprintf(data_log, "OWIO\tOWST\tPWIO\tAVGWIO\n");
+
+    clock_gettime(CLOCK_MONOTONIC, &tstart_slice);
+    clock_gettime(CLOCK_MONOTONIC, &tstart_window);
+    
+    enable_logging = 1;
+    logger_call_start_count++;
+
+    if (errno != 0) {
+        printf("failed to start logger\n");
+        exit(EXIT_FAILURE);
+    }
+    printf("logging started\n");
+}
+
+void end_logging(int signum)
+{
+    errno = 0;
+    enable_logging = 0;
+
+    fclose(raw_data_log);
+    fclose(data_log);
+
+    raw_data_log = NULL;
+    data_log = NULL;
+
+    if (errno != 0) {
+        printf("failed to finish logger\n");
+        exit(EXIT_FAILURE);
+    }
+    printf("logging ended\n");
 }
