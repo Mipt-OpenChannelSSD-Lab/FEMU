@@ -9,7 +9,7 @@ static void *ftl_thread(void *arg);
 
 static void log_request(NvmeRequest *req, char rw_opcode);
 
-static void log_measure();
+void log_measure(void);
 
 // static void init_logger(struct timespec *tstart_slice, struct timespec *tstart_window);
 
@@ -20,13 +20,27 @@ int reads_for_slice = 0;
 int reads_for_window = 0;
 int writes_for_window = 0;
 int cum_reads_lenght = 0;
+int overwrite_for_slice = 0;
 
-int enable_logging = 0;
+typedef struct sliding_window {
+    int reads_for_window;
+    int writes_for_window;
+    int cum_reads_lenght;
+
+    // when it reaches time_window / time_slice, time of entry living expires
+    int counter;
+} sliding_window;
+
+sliding_window *windows = NULL;
+
+// global variables needed for sig handlers
+int enable_logging;
 int logger_call_start_count = 0;
 struct timespec tstart_slice = {0, 0};
 struct timespec tstart_window = {0, 0};
 FILE *raw_data_log = NULL;
 FILE *data_log = NULL;
+int is_time_set = 0;
 
 // signal handler for SIGUSR1
 void start_logging(int signum);
@@ -922,10 +936,19 @@ static void *ftl_thread(void *arg)
     sigact_finish.sa_handler = end_logging;
     sigaction(SIGUSR1, &sigact_start, NULL);
     sigaction(SIGUSR2, &sigact_finish, NULL);
+    enable_logging = 0;
+
+    int windows_amount = (int)(time_window / time_slice);
+    windows = (sliding_window*)calloc(windows_amount, sizeof(sliding_window));
 
     while (1) {
         for (i = 1; i <= n->num_poller; i++) {
             if (enable_logging == 1) {
+                if (is_time_set == 0) {
+                    clock_gettime(CLOCK_MONOTONIC, &tstart_slice);
+                    clock_gettime(CLOCK_MONOTONIC, &tstart_window);
+                    is_time_set = 1;
+                }
                 log_measure();
             }
 
@@ -941,14 +964,24 @@ static void *ftl_thread(void *arg)
             switch (req->cmd.opcode) {
             case NVME_CMD_WRITE: {
                 if (enable_logging == 1) {
-                    log_request(req, "w");
+                    if (is_time_set == 0) {
+                        clock_gettime(CLOCK_MONOTONIC, &tstart_slice);
+                        clock_gettime(CLOCK_MONOTONIC, &tstart_window);
+                        is_time_set = 1;
+                    }
+                    log_request(req, 'w');
                 }
                 lat = ssd_write(ssd, req);
                 break;
             }
             case NVME_CMD_READ: {
                 if (enable_logging == 1) {
-                    log_request(req, "r");
+                    if (is_time_set == 0) {
+                        clock_gettime(CLOCK_MONOTONIC, &tstart_slice);
+                        clock_gettime(CLOCK_MONOTONIC, &tstart_window);
+                        is_time_set = 1;
+                    }
+                    log_request(req, 'r');
                 }
                 lat = ssd_read(ssd, req);
                 break;
@@ -982,13 +1015,13 @@ static void *ftl_thread(void *arg)
 static void log_request(NvmeRequest *req, char rw_opcode)
 {
     int len = req->nlb;
-    if (rw_opcode == "r") {
+    if (rw_opcode == 'r') {
         reads_for_slice++;
         reads_for_window++;
         cum_reads_lenght += len;
     }
 
-    if (rw_opcode == "w") {
+    if (rw_opcode == 'w') {
         writes_for_window++;
     }
 
@@ -996,19 +1029,18 @@ static void log_request(NvmeRequest *req, char rw_opcode)
     struct timespec cur_time = {0, 0};
     clock_gettime(CLOCK_MONOTONIC, &cur_time);
     double time = (double)cur_time.tv_sec + 1.0e-9*cur_time.tv_nsec;
-    fprintf(raw_data_log, "%c\t%lu\t%d\t%lf\n", rw_opcode, lba, len, time);
+    fprintf(raw_data_log, "%c,\t%lu,\t%d,\t%lf,\n", rw_opcode, lba, len, time);
     fflush(raw_data_log);
 }
 
-static void log_measure()
+void log_measure(void)
 {
     struct timespec tend = {0, 0};
     clock_gettime(CLOCK_MONOTONIC, &tend);
     double time_end = (double)tend.tv_sec + 1.0e-9*tend.tv_nsec;
-    double time_begin_slice = (double)tstart_slice->tv_sec + 1.0e-9*tstart_slice->tv_nsec;
-    double time_begin_window = (double)tstart_window->tv_sec + 1.0e-9*tstart_window->tv_nsec;
+    double time_begin_slice = (double)tstart_slice.tv_sec + 1.0e-9*tstart_slice.tv_nsec;
+    double time_begin_window = (double)tstart_window.tv_sec + 1.0e-9*tstart_window.tv_nsec;
 
-    // owst measure is not impelemented
     int owio = 0;
     double owst = 0.0;
     int pwio = 0;
@@ -1017,7 +1049,7 @@ static void log_measure()
     if (time_end - time_begin_slice >= time_slice) {
         owio = reads_for_slice;
         reads_for_slice = 0;
-        clock_gettime(CLOCK_MONOTONIC, tstart_slice);
+        clock_gettime(CLOCK_MONOTONIC, &tstart_slice);
     }
 
     if (time_end - time_begin_window >= time_window) {
@@ -1032,7 +1064,7 @@ static void log_measure()
         reads_for_window = 0;
         cum_reads_lenght = 0;
         writes_for_window = 0;
-        clock_gettime(CLOCK_MONOTONIC, tstart_window);
+        clock_gettime(CLOCK_MONOTONIC, &tstart_window);
     }
 
     if (time_end - time_begin_slice >= time_slice && time_end - time_begin_window >= time_window) {
@@ -1106,6 +1138,7 @@ void end_logging(int signum)
 {
     errno = 0;
     enable_logging = 0;
+    is_time_set = 0;
 
     fclose(raw_data_log);
     fclose(data_log);
