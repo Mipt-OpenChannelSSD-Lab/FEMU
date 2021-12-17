@@ -2,6 +2,8 @@
 
 #include <time.h>
 #include <signal.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 //#define FEMU_DEBUG_FTL
 
@@ -14,16 +16,18 @@ typedef struct sliding_window {
 
     int live_time;
 } sliding_window;
+
 int inserter = 0;
+int current_slice_in_window = 0;
+int python_counter = 0;
 
 static void log_request(NvmeRequest *req, sliding_window *windows, FILE *raw_data_log, char rw_opcode);
 
-static void log_measure(sliding_window *windows, FILE *data_log);
+static void log_measure(sliding_window *windows, int *python_exit_status, FILE *data_log);
 
 const int calls_slice = 20;
 const int calls_window = 100;
 int reads_for_slice = 0;
-int gc_flag = 0;
 
 int io_calls_amount = 0;
 
@@ -856,8 +860,6 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         r = do_gc(ssd, true);
         if (r == -1)
             break;
-
-        gc_flag++;
     }
 
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
@@ -925,10 +927,11 @@ static void *ftl_thread(void *arg)
     sigaction(SIGUSR2, &sigact_finish, NULL);
 
     sliding_window *windows = (sliding_window*)calloc((int)(calls_window / calls_slice), sizeof(sliding_window));
+    int *python_exit_status = (int*)calloc((int)(calls_window / calls_slice), sizeof(int));
 
     while (1) {
         for (i = 1; i <= n->num_poller; i++) {
-            log_measure(windows, data_log);
+            log_measure(windows, python_exit_status, data_log);
 
             if (!ssd->to_ftl[i] || !femu_ring_count(ssd->to_ftl[i]))
                 continue;
@@ -942,7 +945,6 @@ static void *ftl_thread(void *arg)
             switch (req->cmd.opcode) {
             case NVME_CMD_WRITE: {
                 log_request(req, windows, raw_data_log, 'w');
-                gc_flag = 0;
                 lat = ssd_write(ssd, req);
                 break;
             }
@@ -974,6 +976,8 @@ static void *ftl_thread(void *arg)
         }
     }
 
+    free(windows);
+    free(python_exit_status);
     fclose(raw_data_log);
     fclose(data_log);
     return NULL;
@@ -997,21 +1001,23 @@ static void log_request(NvmeRequest *req, sliding_window *windows, FILE *raw_dat
         }
     }
     io_calls_amount++;
+    python_counter++;
 
     uint64_t lba = req->slba;
     struct timespec cur_time = {0, 0};
     double time = (double)cur_time.tv_sec + 1.0e-9*cur_time.tv_nsec;
-    fprintf(raw_data_log, "%c\t%lu\t%d\t%lf\t%d\n", rw_opcode, lba, len, time, gc_flag);
+    fprintf(raw_data_log, "%c\t%lu\t%d\t%lf\n", rw_opcode, lba, len, time);
     fflush(raw_data_log);
 }
 
-static void log_measure(sliding_window *windows, FILE *data_log)
+static void log_measure(sliding_window *windows, int *python_exit_status, FILE *data_log)
 {
     int owio = 0;
     double owst = 0.0;
     double pwio = 0.0;
     double avgwio = 0.0;
 
+    int slices_in_window = (int)(calls_window / calls_slice);
     if (io_calls_amount >= calls_slice) {
         owio = reads_for_slice;
         reads_for_slice = 0;
@@ -1019,7 +1025,7 @@ static void log_measure(sliding_window *windows, FILE *data_log)
         for (int i = 0; i <= inserter; ++i) {
             windows[i].live_time += calls_slice;
         }
-        if (inserter < (int)(calls_window / calls_slice) - 1) {
+        if (inserter < slices_in_window - 1) {
             inserter++;
         }
     }
@@ -1046,6 +1052,82 @@ static void log_measure(sliding_window *windows, FILE *data_log)
         fprintf(data_log, "%d, %lf, %lf, %lf, %d\n", owio, owst, pwio, avgwio, is_virus_working);
         fflush(data_log);
         io_calls_amount = 0;
+
+        if (inserter == slices_in_window - 1 && python_counter == 100) {
+            // char python_arguments[100];
+            // char script_name[50];
+            char **python_arguments = (char**)calloc(10, sizeof(char*));
+            for (int i = 0; i < 10; ++i) {
+                python_arguments[i] = (char*)calloc(20, sizeof(char));
+            }
+            
+            sprintf(python_arguments[0], "/usr/bin/python3");
+            sprintf(python_arguments[1], "knn_inline.py");
+            sprintf(python_arguments[2], "%d", owio);
+            sprintf(python_arguments[3], "%lf", owst);
+            sprintf(python_arguments[4], "%lf", pwio);
+            sprintf(python_arguments[5], "%lf", avgwio);
+            // sprintf(python_arguments, "%d %lf %lf %lf", owio, owst, pwio, avgwio);
+            int tmp_counter = 6;
+            for (int i = current_slice_in_window + 1; i < slices_in_window; ++i) {
+                sprintf(python_arguments[tmp_counter], "%d", python_exit_status[i]);
+                tmp_counter++;
+            }
+
+            for (int i = 0; i < current_slice_in_window; i++) {
+                sprintf(python_arguments[tmp_counter], "%d", python_exit_status[i]);
+                tmp_counter++;
+            }
+
+            int return_value = 0;
+
+            // printf("Here\n");
+            int pid = fork();
+            // printf("Now I am here %d\n", pid);
+            if (pid == 0) {
+                // watch this!
+                errno = 0;
+                execve("/usr/bin/python3", python_arguments, NULL);
+                // printf("checking errno %d\n", errno);
+                exit(EXIT_SUCCESS);
+            } else {
+                waitpid(pid, &return_value, 0);
+            }
+
+            // printf("Check this %d\n", pid);
+            return_value = WEXITSTATUS(return_value);
+            
+            for (int i = 0; i < 10; ++i) {
+                free(python_arguments[i]);
+            }
+            free(python_arguments);
+
+            int predict, verdict;
+            if (return_value == 0) {
+                predict = 0;
+                verdict = 0;
+            } else if (return_value == 1) {
+                predict = 0;
+                verdict = 1;
+            } else if (return_value == 2) {
+                predict = 1;
+                verdict = 0;
+            } else {
+                predict = 1;
+                verdict = 1;
+            }
+
+            if (verdict == 1) {
+                printf("\n!!!Suspected virus activity!!!\n");
+            }
+            python_exit_status[current_slice_in_window] = predict;
+            current_slice_in_window++;
+            if (current_slice_in_window == slices_in_window) {
+                current_slice_in_window = 0;
+            }
+
+            python_counter = 0;
+        }
     }
 }
 
